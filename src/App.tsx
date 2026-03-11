@@ -58,6 +58,7 @@ interface UserData {
   role: string;
   personal_number: string;
   phone?: string;
+  telegram_chat_id?: number | null;
 }
 
 interface Order {
@@ -116,6 +117,8 @@ export default function App() {
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [isAdmin, setIsAdmin] = useState(false);
   const [adminAuth, setAdminAuth] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notifications, setNotifications] = useState<any[]>([]);
 
   // Fetch initial data
   useEffect(() => {
@@ -139,6 +142,39 @@ export default function App() {
       }
     }
   }, []);
+
+  useEffect(() => {
+    if (user?.telegram_chat_id) {
+      setNotifications([
+        {
+          id: 'tg-link',
+          title: 'تم ربط حسابك ببوت تلجرام',
+          message: 'لقد تم ربط حسابك ببوت تلجرام. إن لم تكن أنت، يرجى الضغط على فك الارتباط وتغيير بياناتك.',
+          type: 'warning',
+          action: 'unlink'
+        }
+      ]);
+    } else {
+      setNotifications([]);
+    }
+  }, [user]);
+
+  const handleUnlinkTelegram = async () => {
+    if (!user) return;
+    try {
+      const res = await fetch("/api/user/unlink-telegram", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userId: user.id })
+      });
+      if (res.ok) {
+        fetchUser(user.id);
+        alert("تم فك الارتباط بنجاح. يرجى تغيير كلمة المرور لزيادة الأمان.");
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const fetchUser = async (id: number) => {
     try {
@@ -266,8 +302,8 @@ export default function App() {
           <Menu size={24} className="text-gray-700" />
         </button>
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white font-bold">S</div>
-          <span className="font-bold text-gray-800 hidden sm:block">شحن كارد</span>
+          <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white font-bold">V</div>
+          <span className="font-bold text-gray-800 hidden sm:block">فيبرو</span>
         </div>
       </div>
       
@@ -278,12 +314,67 @@ export default function App() {
             <span className="font-bold">{user.balance.toFixed(2)} $</span>
           </div>
         )}
-        <button className="p-2 hover:bg-gray-50 rounded-full relative">
+        <button onClick={() => setNotificationsOpen(true)} className="p-2 hover:bg-gray-50 rounded-full relative">
           <Bell size={22} className="text-gray-600" />
-          <span className="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full border-2 border-white"></span>
+          {notifications.length > 0 && (
+            <span className="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full border-2 border-white"></span>
+          )}
         </button>
       </div>
     </header>
+  );
+
+  const NotificationPanel = () => (
+    <AnimatePresence>
+      {notificationsOpen && (
+        <>
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setNotificationsOpen(false)}
+            className="fixed inset-0 bg-black/20 z-50"
+          />
+          <motion.div 
+            initial={{ y: "100%" }}
+            animate={{ y: 0 }}
+            exit={{ y: "100%" }}
+            className="fixed bottom-0 left-0 right-0 bg-white z-50 rounded-t-3xl shadow-2xl max-h-[80vh] flex flex-col"
+          >
+            <div className="p-6 border-b border-gray-100 flex items-center justify-between">
+              <h3 className="font-bold text-lg text-gray-800">الإشعارات</h3>
+              <button onClick={() => setNotificationsOpen(false)} className="p-2 bg-gray-100 rounded-full">
+                <XCircle size={20} className="text-gray-400" />
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {notifications.length > 0 ? (
+                notifications.map(notif => (
+                  <div key={notif.id} className={`p-4 rounded-2xl border ${notif.type === 'warning' ? 'bg-amber-50 border-amber-100' : 'bg-blue-50 border-blue-100'}`}>
+                    <h4 className={`font-bold mb-1 ${notif.type === 'warning' ? 'text-amber-800' : 'text-blue-800'}`}>{notif.title}</h4>
+                    <p className={`text-sm leading-relaxed ${notif.type === 'warning' ? 'text-amber-700' : 'text-blue-700'}`}>{notif.message}</p>
+                    {notif.action === 'unlink' && (
+                      <button 
+                        onClick={handleUnlinkTelegram}
+                        className="mt-3 bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold shadow-sm"
+                      >
+                        فك الارتباط الآن
+                      </button>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <div className="flex flex-col items-center justify-center py-12 text-gray-400">
+                  <Bell size={48} className="mb-4 opacity-20" />
+                  <p>لا توجد إشعارات حالياً</p>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
   );
 
   const BottomNav = () => (
@@ -1291,6 +1382,24 @@ export default function App() {
           >
             {loading ? "جاري الحفظ..." : "حفظ التغييرات"}
           </button>
+
+          <div className="pt-4 border-t border-gray-50">
+            <p className="text-[10px] text-gray-400 mb-2">احتفظ ببيانات دخولك في مكان آمن للعودة لحسابك في أي وقت.</p>
+            <button 
+              onClick={() => {
+                const text = `بيانات دخول متجرنا:\nالاسم: ${user?.name}\nالبريد: ${user?.email}\nالرقم الشخصي (ID): ${user?.personal_number}\nرقم الدخول: ${user?.id}`;
+                const blob = new Blob([text], { type: "text/plain" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `my_account_info.txt`;
+                a.click();
+              }}
+              className="w-full bg-gray-100 text-gray-700 py-3 rounded-xl font-bold text-sm"
+            >
+              تحميل بيانات الحساب (نسخة احتياطية)
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -1450,6 +1559,59 @@ export default function App() {
     const [adminUsers, setAdminUsers] = useState<any[]>([]);
     const [newOffer, setNewOffer] = useState({ title: "", description: "", image_url: "" });
 
+    const handleExportDB = async () => {
+      try {
+        const res = await fetch("/api/admin/export-db");
+        const data = await res.json();
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `database_export_${new Date().toISOString().split('T')[0]}.json`;
+        a.click();
+      } catch (e) {
+        alert("فشل تصدير البيانات");
+      }
+    };
+
+    const handleImportDB = async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      
+      if (!confirm("تحذير: سيتم مسح كافة البيانات الحالية واستبدالها بالبيانات المستوردة. هل أنت متأكد؟")) return;
+
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        try {
+          const data = JSON.parse(event.target?.result as string);
+          const res = await fetch("/api/admin/import-db", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(data)
+          });
+          if (res.ok) {
+            alert("تم استيراد البيانات بنجاح! سيتم إعادة تحميل الصفحة.");
+            window.location.reload();
+          } else {
+            const err = await res.json();
+            alert(`فشل الاستيراد: ${err.error}`);
+          }
+        } catch (err) {
+          alert("ملف غير صالح");
+        }
+      };
+      reader.readAsText(file);
+    };
+
+    const handleClearDB = async () => {
+      if (!confirm("هل أنت متأكد من مسح كافة بيانات الموقع؟ لا يمكن التراجع عن هذه الخطوة.")) return;
+      const res = await fetch("/api/admin/clear-db", { method: "POST" });
+      if (res.ok) {
+        alert("تم مسح قاعدة البيانات بنجاح");
+        window.location.reload();
+      }
+    };
+
     useEffect(() => {
       fetchAdminOrders();
       fetchAdminTransactions();
@@ -1476,6 +1638,21 @@ export default function App() {
       if (res.ok) {
         alert("تم تحديث الإعداد بنجاح");
         fetchAdminSettings();
+      }
+    };
+
+    const handleCloudSync = async () => {
+      if (!confirm("هل تريد مزامنة كافة البيانات الحالية مع قاعدة البيانات السحابية (Supabase)؟")) return;
+      try {
+        const res = await fetch("/api/admin/sync-to-cloud", { method: "POST" });
+        if (res.ok) {
+          alert("تمت المزامنة السحابية بنجاح!");
+        } else {
+          const data = await res.json();
+          alert(`فشل المزامنة: ${data.error}`);
+        }
+      } catch (e) {
+        alert("خطأ في الاتصال بالسيرفر");
       }
     };
 
@@ -1905,6 +2082,46 @@ export default function App() {
               </div>
 
               <div className="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm space-y-4">
+                <h3 className="font-bold text-gray-800 border-b border-gray-50 pb-2">المزامنة السحابية (Supabase)</h3>
+                <div className="space-y-3">
+                  <p className="text-xs text-gray-500">رفع كافة البيانات المحلية إلى Supabase لضمان بقائها حتى لو تم مسح السيرفر.</p>
+                  <button 
+                    onClick={handleCloudSync} 
+                    className="w-full bg-indigo-600 text-white py-3 rounded-xl font-bold shadow-lg shadow-indigo-50"
+                  >
+                    بدء المزامنة السحابية
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm space-y-4">
+                <h3 className="font-bold text-gray-800 border-b border-gray-50 pb-2">إدارة قاعدة البيانات</h3>
+                <div className="grid grid-cols-1 gap-3">
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-gray-400">تصدير كافة بيانات الموقع (مستخدمين، طلبات، منتجات) إلى ملف JSON.</p>
+                    <button onClick={handleExportDB} className="w-full bg-emerald-600 text-white py-3 rounded-xl font-bold text-sm shadow-lg shadow-emerald-50">تصدير البيانات (JSON)</button>
+                  </div>
+                  
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-gray-400">استيراد البيانات من ملف JSON (سيتم مسح البيانات الحالية).</p>
+                    <label className="block w-full bg-blue-600 text-white py-3 rounded-xl font-bold text-sm text-center cursor-pointer shadow-lg shadow-blue-50">
+                      استيراد البيانات (JSON)
+                      <input type="file" accept=".json" onChange={handleImportDB} className="hidden" />
+                    </label>
+                  </div>
+
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-gray-400">تحميل ملف قاعدة البيانات الأصلي (.db).</p>
+                    <button onClick={() => window.open("/api/admin/backup-db")} className="w-full bg-slate-700 text-white py-3 rounded-xl font-bold text-sm shadow-lg shadow-slate-50">تحميل نسخة احتياطية (.db)</button>
+                  </div>
+
+                  <div className="pt-4 border-t border-gray-50">
+                    <button onClick={handleClearDB} className="w-full bg-red-50 text-red-600 py-3 rounded-xl font-bold text-sm border border-red-100">مسح كافة البيانات نهائياً</button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-white p-6 rounded-2xl border border-gray-100 shadow-sm space-y-4">
                 <h3 className="font-bold text-gray-800 border-b border-gray-50 pb-2">إدارة البيانات</h3>
                 <div className="space-y-6">
                   <div className="space-y-3">
@@ -1955,6 +2172,7 @@ export default function App() {
     <div className="min-h-screen bg-gray-50 text-right" dir="rtl">
       <Header />
       <Drawer />
+      <NotificationPanel />
       
       <main className="pt-20 pb-24">
         <AnimatePresence mode="wait">

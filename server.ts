@@ -6,14 +6,27 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
+import crypto from "crypto";
+import bcrypt from "bcryptjs";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// --- Supabase Configuration ---
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
+
+if (supabase) {
+  console.log("Supabase integration enabled.");
+}
+
 const db = new Database("database.db");
 db.pragma('foreign_keys = ON');
+db.pragma('journal_mode = WAL');
 
 // Initialize Database Schema
 db.exec(`
@@ -28,7 +41,9 @@ db.exec(`
     personal_number TEXT UNIQUE, -- 7 digit random
     is_vip BOOLEAN DEFAULT 0,
     telegram_chat_id INTEGER UNIQUE,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    referred_by_id INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (referred_by_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS offers (
@@ -199,9 +214,29 @@ async function startServer() {
       console.error("Telegram error", e);
     }
   };
-app.get("/ping", (req, res) => {
-  res.send("OK");
-});
+
+  // --- Real-time Cloud Sync Helper ---
+  const syncToCloud = async (table: string, data: any) => {
+    if (!supabase) return;
+    try {
+      const rows = Array.isArray(data) ? data : [data];
+      const { error } = await supabase.from(table).upsert(rows);
+      if (error) console.error(`Cloud Sync Error (${table}):`, error.message);
+    } catch (e) {
+      console.error(`Cloud Sync Exception (${table}):`, e);
+    }
+  };
+
+  const deleteFromCloud = async (table: string, id: any) => {
+    if (!supabase) return;
+    try {
+      const { error } = await supabase.from(table).delete().eq('id', id);
+      if (error) console.error(`Cloud Delete Error (${table}):`, error.message);
+    } catch (e) {
+      console.error(`Cloud Delete Exception (${table}):`, e);
+    }
+  };
+
   // Auth Routes
   app.post("/api/auth/register", async (req, res) => {
     const { name, email, password, phone, referralCode } = req.body;
@@ -220,10 +255,18 @@ app.get("/ping", (req, res) => {
         if (referrer) referredById = referrer.id;
       }
 
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(password, salt);
+
       const result = db.prepare("INSERT INTO users (name, email, password_hash, phone, personal_number, referred_by_id) VALUES (?, ?, ?, ?, ?, ?)").run(
-        name, email, password, phone, personalNumber, referredById
+        name, email, hashedPassword, phone, personalNumber, referredById
       );
-      const user = db.prepare("SELECT id, name, email, balance, role, personal_number FROM users WHERE id = ?").get(result.lastInsertRowid) as any;
+      
+      const user = db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid) as any;
+      
+      // Auto Sync to Cloud
+      syncToCloud("users", user);
+
       sendTelegramMessage(`👤 مستخدم جديد\nالاسم: ${name}\nالإيميل: ${email}\nالهاتف: ${phone}\nرقم الدخول: ${user.id}\nالرقم الشخصي: ${personalNumber}${referralCode ? `\nتمت الإحالة بواسطة: ${referralCode}` : ''}`);
       res.json(user);
     } catch (e) {
@@ -235,13 +278,17 @@ app.get("/ping", (req, res) => {
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
     const user = db.prepare("SELECT id, name, email, password_hash, balance, role, personal_number, phone FROM users WHERE email = ?").get(email) as any;
-    if (user && user.password_hash === password) {
-      const { password_hash, ...userWithoutPass } = user;
-      sendTelegramMessage(`🔑 تسجيل دخول\nالاسم: ${user.name}\nالإيميل: ${user.email}\nالهاتف: ${user.phone}\nرقم الدخول: ${user.id}\nالرقم الشخصي: ${user.personal_number}`);
-      res.json(userWithoutPass);
-    } else {
-      res.status(401).json({ error: "Invalid credentials" });
+    
+    if (user) {
+      const isMatch = await bcrypt.compare(password, user.password_hash);
+      if (isMatch) {
+        const { password_hash, ...userWithoutPass } = user;
+        sendTelegramMessage(`🔑 تسجيل دخول\nالاسم: ${user.name}\nالإيميل: ${user.email}\nالهاتف: ${user.phone}\nرقم الدخول: ${user.id}\nالرقم الشخصي: ${user.personal_number}`);
+        res.json(userWithoutPass);
+        return;
+      }
     }
+    res.status(401).json({ error: "Invalid credentials" });
   });
 
   // Data Routes
@@ -281,18 +328,36 @@ app.get("/ping", (req, res) => {
     res.json(user || null);
   });
 
-  app.post("/api/user/update", (req, res) => {
+  app.post("/api/user/update", async (req, res) => {
     const { id, name, email, phone, password } = req.body;
     try {
       if (password) {
-        db.prepare("UPDATE users SET name = ?, email = ?, phone = ?, password_hash = ? WHERE id = ?").run(name, email, phone, password, id);
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(password, salt);
+        db.prepare("UPDATE users SET name = ?, email = ?, phone = ?, password_hash = ? WHERE id = ?").run(name, email, phone, hashedPassword, id);
       } else {
         db.prepare("UPDATE users SET name = ?, email = ?, phone = ? WHERE id = ?").run(name, email, phone, id);
       }
-      const user = db.prepare("SELECT id, name, email, balance, role, phone, personal_number, is_vip FROM users WHERE id = ?").get(id);
+      const user = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+      
+      // Auto Sync to Cloud
+      syncToCloud("users", user);
+
       res.json(user);
     } catch (e) {
       res.status(400).json({ error: "Update failed" });
+    }
+  });
+
+  app.post("/api/user/unlink-telegram", (req, res) => {
+    const { userId } = req.body;
+    try {
+      db.prepare("UPDATE users SET telegram_chat_id = NULL WHERE id = ?").run(userId);
+      const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+      syncToCloud("users", user);
+      res.json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: "Unlink failed" });
     }
   });
 
@@ -302,15 +367,17 @@ app.get("/ping", (req, res) => {
   });
 
   app.get("/api/settings", (req, res) => {
-    const settings = db.prepare("SELECT * FROM settings").all() as any[];
-    const result: any = {};
-    settings.forEach(s => result[s.key] = s.value);
-    res.json(result);
+    const settings = db.prepare("SELECT * FROM settings").all();
+    res.json(settings);
   });
 
   app.post("/api/admin/settings", (req, res) => {
     const { key, value } = req.body;
     db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run(key, value);
+    
+    // Auto Sync to Cloud
+    syncToCloud("settings", { key, value });
+
     res.json({ success: true });
   });
 
@@ -346,8 +413,18 @@ app.get("/ping", (req, res) => {
       return orderResult.lastInsertRowid;
     });
 
-    const orderId = transaction();
-    sendTelegramMessage(`🔔 طلب جديد\nID: ${orderId}\nالاسم: ${user.name}\nالإيميل: ${user.email}\nالهاتف: ${user.phone}\nرقم الدخول: ${user.id}\nالرقم الشخصي: ${user.personal_number}\nProduct: ${product.name}\nTotal: ${total}\nData: ${JSON.stringify(extraData)}`);
+      const orderId = transaction();
+      
+      // Auto Sync to Cloud
+      const newOrder = db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId);
+      const newOrderItems = db.prepare("SELECT * FROM order_items WHERE order_id = ?").all(orderId);
+      const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(userId);
+      
+      syncToCloud("orders", newOrder);
+      syncToCloud("order_items", newOrderItems);
+      syncToCloud("users", updatedUser);
+
+      sendTelegramMessage(`🔔 طلب جديد\nID: ${orderId}\nالاسم: ${user.name}\nالإيميل: ${user.email}\nالهاتف: ${user.phone}\nرقم الدخول: ${user.id}\nالرقم الشخصي: ${user.personal_number}\nProduct: ${product.name}\nTotal: ${total}\nData: ${JSON.stringify(extraData)}`);
     res.json({ success: true, orderId });
   });
 
@@ -371,6 +448,10 @@ app.get("/ping", (req, res) => {
     const result = db.prepare("INSERT INTO transactions (user_id, payment_method_id, amount, note, receipt_image_url) VALUES (?, ?, ?, ?, ?)").run(
       userId, paymentMethodId, amount, note, receiptImageUrl
     );
+
+    // Auto Sync to Cloud
+    const newTransaction = db.prepare("SELECT * FROM transactions WHERE id = ?").get(result.lastInsertRowid);
+    syncToCloud("transactions", newTransaction);
 
     sendTelegramMessage(`💳 شحن رصيد جديد\nالاسم: ${user?.name}\nالإيميل: ${user?.email}\nالهاتف: ${user?.phone}\nرقم الدخول: ${user?.id}\nالرقم الشخصي: ${user?.personal_number}\nAmount: ${amount}\nMethod: ${method?.name}\nNote: ${note}\nReceipt: ${receiptImageUrl}`);
     res.json({ success: true, transactionId: result.lastInsertRowid });
@@ -418,6 +499,13 @@ app.get("/ping", (req, res) => {
         db.prepare("UPDATE transactions SET status = 'approved' WHERE id = ?").run(req.params.id);
         db.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").run(transaction.amount, transaction.user_id);
       })();
+      
+      // Auto Sync to Cloud
+      const updatedTransaction = db.prepare("SELECT * FROM transactions WHERE id = ?").get(req.params.id);
+      const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(transaction.user_id);
+      syncToCloud("transactions", updatedTransaction);
+      syncToCloud("users", updatedUser);
+
       res.json({ success: true });
     } else {
       res.status(400).json({ error: "Invalid transaction" });
@@ -435,6 +523,11 @@ app.get("/ping", (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found" });
 
     db.prepare("UPDATE users SET balance = balance + ? WHERE id = ?").run(amount, user.id);
+    
+    // Auto Sync to Cloud
+    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
+    syncToCloud("users", updatedUser);
+
     sendTelegramMessage(`💰 شحن يدوي\nالاسم: ${user.name}\nالرقم الشخصي: ${personalNumber}\nالمبلغ: ${amount}`);
     res.json({ success: true });
   });
@@ -442,7 +535,12 @@ app.get("/ping", (req, res) => {
   // Admin CRUD for Categories/Products
   app.post("/api/admin/categories", (req, res) => {
     const { name, image_url, special_id } = req.body;
-    db.prepare("INSERT INTO categories (name, image_url, special_id) VALUES (?, ?, ?)").run(name, image_url, special_id);
+    const result = db.prepare("INSERT INTO categories (name, image_url, special_id) VALUES (?, ?, ?)").run(name, image_url, special_id);
+    
+    // Auto Sync to Cloud
+    const newCategory = db.prepare("SELECT * FROM categories WHERE id = ?").get(result.lastInsertRowid);
+    syncToCloud("categories", newCategory);
+
     res.json({ success: true });
   });
 
@@ -451,9 +549,14 @@ app.get("/ping", (req, res) => {
     const category = db.prepare("SELECT id FROM categories WHERE special_id = ?").get(category_special_id) as any;
     if (!category) return res.status(404).json({ error: "Main category not found" });
 
-    db.prepare("INSERT INTO subcategories (category_id, name, image_url, special_id) VALUES (?, ?, ?, ?)").run(
+    const result = db.prepare("INSERT INTO subcategories (category_id, name, image_url, special_id) VALUES (?, ?, ?, ?)").run(
       category.id, name, image_url, special_id
     );
+
+    // Auto Sync to Cloud
+    const newSubcategory = db.prepare("SELECT * FROM subcategories WHERE id = ?").get(result.lastInsertRowid);
+    syncToCloud("subcategories", newSubcategory);
+
     res.json({ success: true });
   });
 
@@ -468,17 +571,27 @@ app.get("/ping", (req, res) => {
 
     if (!subcategory) return res.status(404).json({ error: "Subcategory not found" });
 
-    db.prepare("INSERT INTO products (subcategory_id, name, price, description, image_url, requires_input, store_type) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+    const result = db.prepare("INSERT INTO products (subcategory_id, name, price, description, image_url, requires_input, store_type) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
       subcategory.id, name, price, description, image_url, requires_input ? 1 : 0, store_type
     );
+
+    // Auto Sync to Cloud
+    const newProduct = db.prepare("SELECT * FROM products WHERE id = ?").get(result.lastInsertRowid);
+    syncToCloud("products", newProduct);
+
     res.json({ success: true });
   });
 
   app.post("/api/admin/payment-methods", (req, res) => {
     const { name, image_url, wallet_address, min_amount, instructions } = req.body;
-    db.prepare("INSERT INTO payment_methods (name, image_url, wallet_address, min_amount, instructions) VALUES (?, ?, ?, ?, ?)").run(
+    const result = db.prepare("INSERT INTO payment_methods (name, image_url, wallet_address, min_amount, instructions) VALUES (?, ?, ?, ?, ?)").run(
       name, image_url, wallet_address, min_amount, instructions || ""
     );
+
+    // Auto Sync to Cloud
+    const newMethod = db.prepare("SELECT * FROM payment_methods WHERE id = ?").get(result.lastInsertRowid);
+    syncToCloud("payment_methods", newMethod);
+
     res.json({ success: true });
   });
 
@@ -500,16 +613,20 @@ app.get("/ping", (req, res) => {
           const prodCount = db.prepare("SELECT COUNT(*) as count FROM products WHERE subcategory_id = ?").get(sub.id) as { count: number };
           if (prodCount.count > 0) {
             db.prepare("UPDATE subcategories SET active = 0 WHERE id = ?").run(sub.id);
+            syncToCloud("subcategories", db.prepare("SELECT * FROM subcategories WHERE id = ?").get(sub.id));
           } else {
             db.prepare("DELETE FROM subcategories WHERE id = ?").run(sub.id);
+            deleteFromCloud("subcategories", sub.id);
           }
         }
         
         const subCount = db.prepare("SELECT COUNT(*) as count FROM subcategories WHERE category_id = ?").get(req.params.id) as { count: number };
         if (subCount.count > 0) {
           db.prepare("UPDATE categories SET active = 0 WHERE id = ?").run(req.params.id);
+          syncToCloud("categories", db.prepare("SELECT * FROM categories WHERE id = ?").get(req.params.id));
         } else {
           db.prepare("DELETE FROM categories WHERE id = ?").run(req.params.id);
+          deleteFromCloud("categories", req.params.id);
         }
       });
       transaction();
@@ -528,8 +645,10 @@ app.get("/ping", (req, res) => {
           const orderCount = db.prepare("SELECT COUNT(*) as count FROM order_items WHERE product_id = ?").get(prod.id) as { count: number };
           if (orderCount.count > 0) {
             db.prepare("UPDATE products SET available = 0 WHERE id = ?").run(prod.id);
+            syncToCloud("products", db.prepare("SELECT * FROM products WHERE id = ?").get(prod.id));
           } else {
             db.prepare("DELETE FROM products WHERE id = ?").run(prod.id);
+            deleteFromCloud("products", prod.id);
           }
         }
         
@@ -554,9 +673,11 @@ app.get("/ping", (req, res) => {
     if (orderCount.count > 0) {
       // If it has orders, just mark as unavailable to preserve history
       db.prepare("UPDATE products SET available = 0 WHERE id = ?").run(req.params.id);
+      syncToCloud("products", db.prepare("SELECT * FROM products WHERE id = ?").get(req.params.id));
     } else {
       // If no orders, hard delete
       db.prepare("DELETE FROM products WHERE id = ?").run(req.params.id);
+      deleteFromCloud("products", req.params.id);
     }
     res.json({ success: true });
   });
@@ -567,21 +688,29 @@ app.get("/ping", (req, res) => {
     if (transactionCount.count > 0) {
       // If it has transactions, just mark as inactive
       db.prepare("UPDATE payment_methods SET active = 0 WHERE id = ?").run(req.params.id);
+      syncToCloud("payment_methods", db.prepare("SELECT * FROM payment_methods WHERE id = ?").get(req.params.id));
     } else {
       // If no transactions, hard delete
       db.prepare("DELETE FROM payment_methods WHERE id = ?").run(req.params.id);
+      deleteFromCloud("payment_methods", req.params.id);
     }
     res.json({ success: true });
   });
 
   app.post("/api/admin/banners", (req, res) => {
     const { image_url } = req.body;
-    db.prepare("INSERT INTO banners (image_url) VALUES (?)").run(image_url);
+    const result = db.prepare("INSERT INTO banners (image_url) VALUES (?)").run(image_url);
+    
+    // Auto Sync to Cloud
+    const newBanner = db.prepare("SELECT * FROM banners WHERE id = ?").get(result.lastInsertRowid);
+    syncToCloud("banners", newBanner);
+
     res.json({ success: true });
   });
 
   app.delete("/api/admin/banners/:id", (req, res) => {
     db.prepare("DELETE FROM banners WHERE id = ?").run(req.params.id);
+    deleteFromCloud("banners", req.params.id);
     res.json({ success: true });
   });
 
@@ -593,18 +722,115 @@ app.get("/ping", (req, res) => {
   app.post("/api/admin/users/:id/vip", (req, res) => {
     const { isVip } = req.body;
     db.prepare("UPDATE users SET is_vip = ? WHERE id = ?").run(isVip ? 1 : 0, req.params.id);
+    
+    // Auto Sync to Cloud
+    const updatedUser = db.prepare("SELECT * FROM users WHERE id = ?").get(req.params.id);
+    syncToCloud("users", updatedUser);
+
     res.json({ success: true });
   });
 
   app.post("/api/admin/offers", (req, res) => {
     const { title, description, image_url } = req.body;
-    db.prepare("INSERT INTO offers (title, description, image_url) VALUES (?, ?, ?)").run(title, description, image_url);
+    const result = db.prepare("INSERT INTO offers (title, description, image_url) VALUES (?, ?, ?)").run(title, description, image_url);
+    
+    // Auto Sync to Cloud
+    const newOffer = db.prepare("SELECT * FROM offers WHERE id = ?").get(result.lastInsertRowid);
+    syncToCloud("offers", newOffer);
+
     res.json({ success: true });
   });
 
   app.delete("/api/admin/offers/:id", (req, res) => {
     db.prepare("DELETE FROM offers WHERE id = ?").run(req.params.id);
+    deleteFromCloud("offers", req.params.id);
     res.json({ success: true });
+  });
+
+  app.get("/api/admin/export-db", (req, res) => {
+    const tables = ["users", "categories", "subcategories", "products", "orders", "order_items", "transactions", "settings", "banners", "offers"];
+    const data: any = {};
+    tables.forEach(table => {
+      data[table] = db.prepare(`SELECT * FROM ${table}`).all();
+    });
+    res.json(data);
+  });
+
+  app.post("/api/admin/import-db", express.json({ limit: '50mb' }), (req, res) => {
+    const data = req.body;
+    const tables = ["users", "categories", "subcategories", "products", "orders", "order_items", "transactions", "settings", "banners", "offers"];
+    
+    try {
+      const importTransaction = db.transaction(() => {
+        tables.forEach(table => {
+          if (data[table]) {
+            db.prepare(`DELETE FROM ${table}`).run();
+            const rows = data[table];
+            if (rows.length > 0) {
+              const columns = Object.keys(rows[0]);
+              const placeholders = columns.map(() => "?").join(",");
+              const stmt = db.prepare(`INSERT INTO ${table} (${columns.join(",")}) VALUES (${placeholders})`);
+              rows.forEach((row: any) => {
+                const values = columns.map(col => row[col]);
+                stmt.run(...values);
+              });
+            }
+          }
+        });
+      });
+      importTransaction();
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/clear-db", (req, res) => {
+    const tables = ["users", "categories", "subcategories", "products", "orders", "order_items", "transactions", "settings", "banners", "offers"];
+    try {
+      const clearTransaction = db.transaction(() => {
+        tables.forEach(table => {
+          db.prepare(`DELETE FROM ${table}`).run();
+        });
+        // Re-insert default settings if needed
+        db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run('privacy_policy', 'سياسة الخصوصية الافتراضية');
+        db.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run('support_whatsapp', '9640000000000');
+      });
+      clearTransaction();
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/sync-to-cloud", async (req, res) => {
+    if (!supabase) return res.status(400).json({ error: "Supabase not configured" });
+
+    try {
+      const tables = ["users", "categories", "subcategories", "products", "orders", "order_items", "transactions", "settings", "banners", "offers", "payment_methods"];
+      
+      for (const table of tables) {
+        const rows = db.prepare(`SELECT * FROM ${table}`).all();
+        if (rows.length > 0) {
+          const { error } = await supabase.from(table).upsert(rows);
+          if (error) throw error;
+        }
+      }
+      
+      res.json({ success: true });
+    } catch (e: any) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/admin/backup-db", (req, res) => {
+    const dbPath = path.join(__dirname, "database.db");
+    if (fs.existsSync(dbPath)) {
+      res.download(dbPath);
+    } else {
+      res.status(404).json({ error: "Database file not found" });
+    }
   });
 
   // Vite middleware for development
@@ -625,28 +851,45 @@ app.get("/ping", (req, res) => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 
-  // Graceful shutdown for Telegram bot
-  process.on('SIGINT', () => {
-    userBot.stopPolling();
-    process.exit();
-  });
-  process.on('SIGTERM', () => {
-    userBot.stopPolling();
-    process.exit();
-  });
-
   // --- Secondary Telegram Bot for Users ---
   const userBotToken = process.env.TELEGRAM_USER_BOT_TOKEN || "7971005794:AAF8kIyk1CmLrzItMOsHRb5QG3PRcyOHk5M";
   let userBot: TelegramBot | undefined;
   
+  // Graceful shutdown for Telegram bot
+  const shutdownBot = () => {
+    if (userBot) {
+      console.log("Stopping Telegram bot polling...");
+      userBot.stopPolling();
+    }
+  };
+
+  process.on('SIGINT', () => {
+    shutdownBot();
+    process.exit();
+  });
+  process.on('SIGTERM', () => {
+    shutdownBot();
+    process.exit();
+  });
+
   // Add a small delay to avoid 409 conflict during rapid restarts
   setTimeout(() => {
-    userBot = new TelegramBot(userBotToken, { polling: true });
+    userBot = new TelegramBot(userBotToken, { 
+      polling: {
+        autoStart: true,
+        params: {
+          timeout: 10
+        }
+      } 
+    });
 
     // Handle polling errors to avoid crashing or flooding logs
     userBot.on("polling_error", (error: any) => {
       if (error.message.includes("409 Conflict")) {
         console.log("Telegram bot conflict: Another instance is running. This is common during rapid restarts.");
+      } else if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.message.includes('ECONNRESET')) {
+        // These are common network issues, log as info instead of error
+        console.log(`Telegram bot network issue (${error.code || 'ECONNRESET'}). Reconnecting...`);
       } else {
         console.error("Telegram polling error:", error);
       }
@@ -738,15 +981,60 @@ app.get("/ping", (req, res) => {
       } else if (data?.startsWith("sub_")) {
         const subId = data.split("_")[1];
         const products = db.prepare("SELECT * FROM products WHERE subcategory_id = ? AND available = 1").all(subId) as any[];
-        let text = "📦 المنتجات المتاحة:\n\n";
-        products.forEach(p => {
-          text += `🔹 ${p.name}\nالسعر: ${p.price} $\n${p.description || ""}\n\n`;
+        const keyboard = products.map(p => [{ text: `${p.name} - ${p.price}$`, callback_data: `buy_${p.id}` }]);
+        userBot.sendMessage(chatId, "اختر المنتج للشراء:", {
+          reply_markup: { inline_keyboard: keyboard }
         });
-        userBot.sendMessage(chatId, text + "\nلطلب أي منتج يرجى زيارة الموقع الإلكتروني.");
+      } else if (data?.startsWith("buy_")) {
+        const prodId = data.split("_")[1];
+        const product = db.prepare("SELECT * FROM products WHERE id = ?").get(prodId) as any;
+        const user = db.prepare("SELECT * FROM users WHERE telegram_chat_id = ?").get(chatId) as any;
+        
+        if (!user) return userBot.sendMessage(chatId, "يرجى تسجيل الدخول أولاً.");
+        
+        const price = user.is_vip ? product.price * 0.95 : product.price;
+        
+        if (user.balance < price) {
+          return userBot.sendMessage(chatId, `❌ رصيدك غير كافٍ. السعر: ${price.toFixed(2)}$ ورصيدك: ${user.balance.toFixed(2)}$`);
+        }
+
+        if (product.requires_input || product.store_type === 'quick_order') {
+          const prompt = product.store_type === 'quick_order' ? "يرجى إدخال معرف اللاعب (ID):" : "يرجى إدخال البيانات المطلوبة للمنتج:";
+          userStates.set(chatId, { step: "purchase_input", data: { productId: prodId, price } });
+          userBot.sendMessage(chatId, prompt);
+        } else {
+          // Direct purchase
+          processBotOrder(chatId, user, product, price, {});
+        }
       }
     });
 
-    userBot.on("message", (msg) => {
+    async function processBotOrder(chatId: number, user: any, product: any, price: number, extraData: any) {
+      try {
+        const transaction = db.transaction(() => {
+          db.prepare("UPDATE users SET balance = balance - ? WHERE id = ?").run(price, user.id);
+          const orderResult = db.prepare("INSERT INTO orders (user_id, total_amount, meta) VALUES (?, ?, ?)").run(user.id, price, JSON.stringify(extraData));
+          db.prepare("INSERT INTO order_items (order_id, product_id, price_at_purchase, quantity, extra_data) VALUES (?, ?, ?, ?, ?)").run(
+            orderResult.lastInsertRowid, product.id, product.price, 1, JSON.stringify(extraData)
+          );
+          return orderResult.lastInsertRowid;
+        });
+
+        const orderId = transaction();
+        
+        // Sync
+        syncToCloud("orders", db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId));
+        syncToCloud("users", db.prepare("SELECT * FROM users WHERE id = ?").get(user.id));
+
+        userBot.sendMessage(chatId, `✅ تمت عملية الشراء بنجاح!\nرقم الطلب: ${orderId}\nالمنتج: ${product.name}\nالمبلغ المخصوم: ${price.toFixed(2)}$`);
+        sendTelegramMessage(`🔔 طلب جديد من البوت\nID: ${orderId}\nالاسم: ${user.name}\nProduct: ${product.name}\nTotal: ${price}`);
+      } catch (e) {
+        console.error(e);
+        userBot.sendMessage(chatId, "❌ حدث خطأ أثناء معالجة الطلب.");
+      }
+    }
+
+    userBot.on("message", async (msg) => {
       const chatId = msg.chat.id;
       const text = msg.text;
       if (!text || text.startsWith("/")) return;
@@ -754,21 +1042,31 @@ app.get("/ping", (req, res) => {
       const state = userStates.get(chatId);
       if (!state) return;
 
-      if (state.step === "login_email") {
+      if (state.step === "purchase_input") {
+        const product = db.prepare("SELECT * FROM products WHERE id = ?").get(state.data.productId) as any;
+        const user = db.prepare("SELECT * FROM users WHERE telegram_chat_id = ?").get(chatId) as any;
+        const extraData = product.store_type === 'quick_order' ? { playerId: text, storeType: 'quick_order' } : { input: text };
+        
+        userStates.delete(chatId);
+        processBotOrder(chatId, user, product, state.data.price, extraData);
+      } else if (state.step === "login_email") {
         state.data.email = text;
         state.step = "login_password";
         userBot.sendMessage(chatId, "يرجى إدخال كلمة المرور:");
       } else if (state.step === "login_password") {
-        const user = db.prepare("SELECT * FROM users WHERE email = ? AND password_hash = ?").get(state.data.email, text) as any;
+        const user = db.prepare("SELECT * FROM users WHERE email = ?").get(state.data.email) as any;
         if (user) {
-          db.prepare("UPDATE users SET telegram_chat_id = ? WHERE id = ?").run(chatId, user.id);
-          userStates.delete(chatId);
-          userBot.sendMessage(chatId, "✅ تم تسجيل الدخول بنجاح!");
-          sendMainMenu(chatId, user, userBot);
-        } else {
-          userBot.sendMessage(chatId, "❌ البريد الإلكتروني أو كلمة المرور غير صحيحة. حاول مرة أخرى /start");
-          userStates.delete(chatId);
+          const isMatch = await bcrypt.compare(text, user.password_hash);
+          if (isMatch) {
+            db.prepare("UPDATE users SET telegram_chat_id = ? WHERE id = ?").run(chatId, user.id);
+            userStates.delete(chatId);
+            userBot.sendMessage(chatId, "✅ تم تسجيل الدخول بنجاح!");
+            sendMainMenu(chatId, user, userBot);
+            return;
+          }
         }
+        userBot.sendMessage(chatId, "❌ البريد الإلكتروني أو كلمة المرور غير صحيحة. حاول مرة أخرى /start");
+        userStates.delete(chatId);
       } else if (state.step === "register_name") {
         state.data.name = text;
         state.step = "register_email";
@@ -797,8 +1095,11 @@ app.get("/ping", (req, res) => {
             if (referrer) referredById = referrer.id;
           }
 
+          const salt = await bcrypt.genSalt(10);
+          const hashedPassword = await bcrypt.hash(state.data.password, salt);
+
           const result = db.prepare("INSERT INTO users (name, email, password_hash, phone, personal_number, telegram_chat_id, referred_by_id) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
-            state.data.name, state.data.email, state.data.password, state.data.phone, personalNumber, chatId, referredById
+            state.data.name, state.data.email, hashedPassword, state.data.phone, personalNumber, chatId, referredById
           );
           const user = db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid) as any;
           userStates.delete(chatId);
