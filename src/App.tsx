@@ -1203,7 +1203,7 @@ export default function App() {
                 </button>
               ) : (
                 <button 
-                  onClick={() => window.open(`https://t.me/vibro_bot`, '_blank')}
+                  onClick={() => window.open(`https://t.me/viprostorebot?start`, '_blank')}
                   className="flex-1 bg-emerald-50 text-emerald-600 p-4 rounded-2xl border border-emerald-100 flex flex-col items-center gap-1 transition-all active:scale-95"
                 >
                   <MessageSquare size={20} />
