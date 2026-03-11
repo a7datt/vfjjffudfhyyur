@@ -199,7 +199,9 @@ async function startServer() {
       console.error("Telegram error", e);
     }
   };
-
+app.get("/ping", (req, res) => {
+  res.send("OK");
+});
   // Auth Routes
   app.post("/api/auth/register", async (req, res) => {
     const { name, email, password, phone, referralCode } = req.body;
