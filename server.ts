@@ -40,10 +40,22 @@ db.exec(`
     role TEXT DEFAULT 'user',
     personal_number TEXT UNIQUE, -- 7 digit random
     is_vip BOOLEAN DEFAULT 0,
+    is_banned BOOLEAN DEFAULT 0,
     telegram_chat_id INTEGER UNIQUE,
     referred_by_id INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (referred_by_id) REFERENCES users(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, -- NULL for all users
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    type TEXT DEFAULT 'info', -- info, warning, success
+    is_read BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
   );
 
   CREATE TABLE IF NOT EXISTS offers (
@@ -171,6 +183,7 @@ migrate("products", "store_type", "TEXT DEFAULT 'normal'");
 migrate("payment_methods", "min_amount", "DECIMAL(10, 2) DEFAULT 0");
 migrate("users", "referred_by_id", "INTEGER");
 migrate("users", "phone", "TEXT");
+migrate("users", "is_banned", "BOOLEAN DEFAULT 0");
 
 // Backfill personal_number for existing users
 const usersWithoutPN = db.prepare("SELECT id FROM users WHERE personal_number IS NULL").all() as any[];
@@ -194,6 +207,10 @@ if (categoryCount.count === 0) {
 // User request: Delete specific categories
 db.prepare("DELETE FROM categories WHERE name IN ('ألعاب', 'تطبيقات')").run();
 
+const userStates = new Map<number, { step: string; data: any }>();
+let adminBot: any = null;
+let userBot: any = null;
+
 async function startServer() {
   const app = express();
   app.use(express.json());
@@ -214,6 +231,133 @@ async function startServer() {
       console.error("Telegram error", e);
     }
   };
+
+  // Admin Bot Logic
+  const adminBotToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (adminBotToken) {
+    // Add a small delay to avoid 409 conflict during rapid restarts
+    setTimeout(() => {
+      adminBot = new TelegramBot(adminBotToken, { polling: true });
+      const adminChatId = process.env.TELEGRAM_CHAT_ID;
+
+      adminBot.on("polling_error", (error: any) => {
+        if (error.message.includes("409 Conflict")) {
+          console.log("Admin Telegram bot conflict: Another instance is running.");
+        } else {
+          console.error("Admin Telegram polling error:", error);
+        }
+      });
+
+      adminBot.on("message", async (msg: any) => {
+      const chatId = msg.chat.id.toString();
+      if (chatId !== adminChatId) return;
+
+      const text = msg.text || "";
+
+      if (text === "مستخدمين") {
+        const users = db.prepare("SELECT * FROM users ORDER BY created_at DESC LIMIT 20").all() as any[];
+        let response = "👥 قائمة آخر 20 مستخدم:\n\n";
+        users.forEach(u => {
+          response += `ID: ${u.id} | PN: ${u.personal_number}\nالاسم: ${u.name}\nالرصيد: ${u.balance}$\nVIP: ${u.is_vip ? 'نعم' : 'لا'}\n\n`;
+        });
+        adminBot.sendMessage(chatId, response, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "منح VIP (أدخل ID)", callback_data: "admin_grant_vip" }]
+            ]
+          }
+        });
+      } else if (text === "إضافة قسم") {
+        userStates.set(parseInt(chatId), { step: "admin_add_cat_name", data: {} });
+        adminBot.sendMessage(chatId, "يرجى إدخال اسم القسم الجديد:");
+      } else if (text === "إضافة منتج") {
+        userStates.set(parseInt(chatId), { step: "admin_add_prod_subid", data: {} });
+        adminBot.sendMessage(chatId, "يرجى إدخال ID القسم الفرعي:");
+      } else if (text === "إضافة قسم فرعي") {
+        userStates.set(parseInt(chatId), { step: "admin_add_sub_catid", data: {} });
+        adminBot.sendMessage(chatId, "يرجى إدخال ID القسم الرئيسي:");
+      } else if (text === "إضافة بانر") {
+        userStates.set(parseInt(chatId), { step: "admin_add_banner_url", data: {} });
+        adminBot.sendMessage(chatId, "يرجى إدخال رابط صورة البانر:");
+      } else if (text.startsWith("/nall ")) {
+        const message = text.replace("/nall ", "");
+        db.prepare("INSERT INTO notifications (title, message, type) VALUES (?, ?, ?)").run("إعلان جديد", message, "info");
+        const users = db.prepare("SELECT telegram_chat_id FROM users WHERE telegram_chat_id IS NOT NULL").all() as any[];
+        users.forEach(u => {
+          userBot?.sendMessage(u.telegram_chat_id, `🔔 إعلان جديد:\n\n${message}`);
+        });
+        adminBot.sendMessage(chatId, "✅ تم إرسال الإشعار للجميع.");
+      } else if (text.startsWith("/nhe ")) {
+        const parts = text.split(" ");
+        if (parts.length < 3) return adminBot.sendMessage(chatId, "❌ الصيغة: /nhe <رقم_شخصي> <الرسالة>");
+        const pn = parts[1];
+        const message = parts.slice(2).join(" ");
+        const user = db.prepare("SELECT id, telegram_chat_id FROM users WHERE personal_number = ?").get(pn) as any;
+        if (!user) return adminBot.sendMessage(chatId, "❌ المستخدم غير موجود.");
+        db.prepare("INSERT INTO notifications (user_id, title, message, type) VALUES (?, ?, ?, ?)").run(user.id, "تنبيه خاص", message, "warning");
+        if (user.telegram_chat_id) {
+          userBot?.sendMessage(user.telegram_chat_id, `🔔 تنبيه خاص:\n\n${message}`);
+        }
+        adminBot.sendMessage(chatId, "✅ تم إرسال الإشعار للمستخدم.");
+      } else if (text.startsWith("/deli ")) {
+        const pn = text.replace("/deli ", "").trim();
+        const user = db.prepare("SELECT id FROM users WHERE personal_number = ?").get(pn) as any;
+        if (!user) return adminBot.sendMessage(chatId, "❌ المستخدم غير موجود.");
+        
+        db.transaction(() => {
+          db.prepare("DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE user_id = ?)").run(user.id);
+          db.prepare("DELETE FROM orders WHERE user_id = ?").run(user.id);
+          db.prepare("DELETE FROM transactions WHERE user_id = ?").run(user.id);
+          db.prepare("DELETE FROM notifications WHERE user_id = ?").run(user.id);
+          db.prepare("DELETE FROM users WHERE id = ?").run(user.id);
+        })();
+        
+        adminBot.sendMessage(chatId, `✅ تم حذف المستخدم ${pn} وكافة بياناته نهائياً.`);
+      } else if (text === "طلبات") {
+        const orders = db.prepare(`
+          SELECT o.id, u.name, o.total_amount, o.status, o.created_at 
+          FROM orders o JOIN users u ON o.user_id = u.id 
+          ORDER BY o.created_at DESC LIMIT 10
+        `).all() as any[];
+        let response = "📦 آخر 10 طلبات:\n\n";
+        orders.forEach(o => {
+          response += `ID: ${o.id} | ${o.name}\nالمبلغ: ${o.total_amount}$ | الحالة: ${o.status}\n\n`;
+        });
+        adminBot.sendMessage(chatId, response);
+      } else if (text === "دفعات") {
+        const txs = db.prepare(`
+          SELECT t.id, u.name, t.amount, t.status, t.created_at 
+          FROM transactions t JOIN users u ON t.user_id = u.id 
+          ORDER BY t.created_at DESC LIMIT 10
+        `).all() as any[];
+        let response = "💳 آخر 10 عمليات شحن:\n\n";
+        txs.forEach(t => {
+          response += `ID: ${t.id} | ${t.name}\nالمبلغ: ${t.amount}$ | الحالة: ${t.status}\n\n`;
+        });
+        adminBot.sendMessage(chatId, response);
+      }
+    });
+
+    adminBot.on("callback_query", (query: any) => {
+      const chatId = query.message?.chat.id;
+      if (!chatId) return;
+      if (query.data === "admin_grant_vip") {
+        adminBot.sendMessage(chatId, "يرجى إرسال ID المستخدم لمنحه VIP (مثال: vip 5):");
+      }
+    });
+
+    adminBot.on("message", (msg: any) => {
+      const text = msg.text || "";
+      if (text.startsWith("vip ")) {
+        const userId = text.replace("vip ", "").trim();
+        db.prepare("UPDATE users SET is_vip = 1 WHERE id = ?").run(userId);
+        const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+        syncToCloud("users", user);
+        adminBot.sendMessage(msg.chat.id, `✅ تم منح VIP للمستخدم ${user?.name}`);
+      }
+    });
+    }, 1000);
+  }
 
   // --- Real-time Cloud Sync Helper ---
   const syncToCloud = async (table: string, data: any) => {
@@ -236,6 +380,21 @@ async function startServer() {
       console.error(`Cloud Delete Exception (${table}):`, e);
     }
   };
+
+  app.get("/api/notifications/:userId", (req, res) => {
+    const notifications = db.prepare(`
+      SELECT * FROM notifications 
+      WHERE (user_id = ? OR user_id IS NULL) 
+      ORDER BY created_at DESC
+    `).all(req.params.userId);
+    res.json(notifications);
+  });
+
+  app.post("/api/notifications/mark-read", (req, res) => {
+    const { notificationId } = req.body;
+    db.prepare("UPDATE notifications SET is_read = 1 WHERE id = ?").run(notificationId);
+    res.json({ success: true });
+  });
 
   // Auth Routes
   app.post("/api/auth/register", async (req, res) => {
@@ -277,9 +436,12 @@ async function startServer() {
 
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
-    const user = db.prepare("SELECT id, name, email, password_hash, balance, role, personal_number, phone FROM users WHERE email = ?").get(email) as any;
+    const user = db.prepare("SELECT id, name, email, password_hash, balance, role, personal_number, phone, is_banned, is_vip, telegram_chat_id FROM users WHERE email = ?").get(email) as any;
     
     if (user) {
+      if (user.is_banned) {
+        return res.status(403).json({ error: "Your account has been banned." });
+      }
       const isMatch = await bcrypt.compare(password, user.password_hash);
       if (isMatch) {
         const { password_hash, ...userWithoutPass } = user;
@@ -853,13 +1015,16 @@ async function startServer() {
 
   // --- Secondary Telegram Bot for Users ---
   const userBotToken = process.env.TELEGRAM_USER_BOT_TOKEN || "7971005794:AAF8kIyk1CmLrzItMOsHRb5QG3PRcyOHk5M";
-  let userBot: TelegramBot | undefined;
   
-  // Graceful shutdown for Telegram bot
+  // Graceful shutdown for Telegram bots
   const shutdownBot = () => {
     if (userBot) {
-      console.log("Stopping Telegram bot polling...");
+      console.log("Stopping User Telegram bot polling...");
       userBot.stopPolling();
+    }
+    if (adminBot) {
+      console.log("Stopping Admin Telegram bot polling...");
+      adminBot.stopPolling();
     }
   };
 
@@ -894,8 +1059,6 @@ async function startServer() {
         console.error("Telegram polling error:", error);
       }
     });
-
-    const userStates = new Map<number, { step: string; data: any }>();
 
     userBot.onText(/\/start(?:\s+(.+))?/, (msg, match) => {
       const chatId = msg.chat.id;
@@ -943,6 +1106,35 @@ async function startServer() {
       } else if (data === "my_info") {
         const user = db.prepare("SELECT * FROM users WHERE telegram_chat_id = ?").get(chatId) as any;
         userBot.sendMessage(chatId, `👤 معلوماتي:\nالاسم: ${user.name}\nالإيميل: ${user.email}\nرقم الدخول: ${user.id}\nالرقم الشخصي: ${user.personal_number}\nالحالة: ${user.is_vip ? 'VIP 💎' : 'عادي'}`);
+      } else if (data === "my_orders") {
+        const orders = db.prepare(`
+          SELECT o.id, p.name, o.total_amount, o.status 
+          FROM orders o 
+          JOIN order_items oi ON o.id = oi.order_id 
+          JOIN products p ON oi.product_id = p.id 
+          WHERE o.user_id = (SELECT id FROM users WHERE telegram_chat_id = ?) 
+          ORDER BY o.created_at DESC LIMIT 5
+        `).all(chatId) as any[];
+        if (orders.length === 0) return userBot.sendMessage(chatId, "ليس لديك طلبات سابقة.");
+        let text = "📦 آخر 5 طلبات لك:\n\n";
+        orders.forEach(o => {
+          text += `🔹 طلب #${o.id}\nالمنتج: ${o.name}\nالمبلغ: ${o.total_amount}$\nالحالة: ${o.status}\n\n`;
+        });
+        userBot.sendMessage(chatId, text);
+      } else if (data === "my_payments") {
+        const txs = db.prepare(`
+          SELECT t.id, t.amount, t.status, pm.name as method 
+          FROM transactions t 
+          JOIN payment_methods pm ON t.payment_method_id = pm.id 
+          WHERE t.user_id = (SELECT id FROM users WHERE telegram_chat_id = ?) 
+          ORDER BY t.created_at DESC LIMIT 5
+        `).all(chatId) as any[];
+        if (txs.length === 0) return userBot.sendMessage(chatId, "ليس لديك عمليات شحن سابقة.");
+        let text = "💳 آخر 5 عمليات شحن لك:\n\n";
+        txs.forEach(t => {
+          text += `🔹 شحن #${t.id}\nالمبلغ: ${t.amount}$\nالطريقة: ${t.method}\nالحالة: ${t.status}\n\n`;
+        });
+        userBot.sendMessage(chatId, text);
       } else if (data === "referral") {
         const user = db.prepare("SELECT personal_number FROM users WHERE telegram_chat_id = ?").get(chatId) as any;
         const count = db.prepare("SELECT COUNT(*) as count FROM users WHERE referred_by_id = (SELECT id FROM users WHERE telegram_chat_id = ?)").get(chatId) as { count: number };
@@ -1033,6 +1225,59 @@ async function startServer() {
         userBot.sendMessage(chatId, "❌ حدث خطأ أثناء معالجة الطلب.");
       }
     }
+
+    adminBot.on("message", async (msg) => {
+      const chatId = msg.chat.id;
+      const text = msg.text;
+      if (!text || text.startsWith("/")) return;
+
+      const state = userStates.get(chatId);
+      if (!state) return;
+
+      if (state.step === "admin_add_cat_name") {
+        state.data.name = text;
+        state.step = "admin_add_cat_url";
+        adminBot.sendMessage(chatId, "يرجى إدخال رابط صورة القسم:");
+      } else if (state.step === "admin_add_cat_url") {
+        const result = db.prepare("INSERT INTO categories (name, image_url) VALUES (?, ?)").run(state.data.name, text);
+        syncToCloud("categories", db.prepare("SELECT * FROM categories WHERE id = ?").get(result.lastInsertRowid));
+        userStates.delete(chatId);
+        adminBot.sendMessage(chatId, "✅ تم إضافة القسم بنجاح!");
+      } else if (state.step === "admin_add_sub_catid") {
+        state.data.catId = text;
+        state.step = "admin_add_sub_name";
+        adminBot.sendMessage(chatId, "يرجى إدخال اسم القسم الفرعي:");
+      } else if (state.step === "admin_add_sub_name") {
+        const result = db.prepare("INSERT INTO subcategories (category_id, name) VALUES (?, ?)").run(state.data.catId, text);
+        syncToCloud("subcategories", db.prepare("SELECT * FROM subcategories WHERE id = ?").get(result.lastInsertRowid));
+        userStates.delete(chatId);
+        adminBot.sendMessage(chatId, "✅ تم إضافة القسم الفرعي بنجاح!");
+      } else if (state.step === "admin_add_prod_subid") {
+        state.data.subId = text;
+        state.step = "admin_add_prod_name";
+        adminBot.sendMessage(chatId, "يرجى إدخال اسم المنتج:");
+      } else if (state.step === "admin_add_prod_name") {
+        state.data.name = text;
+        state.step = "admin_add_prod_price";
+        adminBot.sendMessage(chatId, "يرجى إدخال سعر المنتج:");
+      } else if (state.step === "admin_add_prod_price") {
+        state.data.price = text;
+        state.step = "admin_add_prod_url";
+        adminBot.sendMessage(chatId, "يرجى إدخال رابط صورة المنتج:");
+      } else if (state.step === "admin_add_prod_url") {
+        const result = db.prepare("INSERT INTO products (subcategory_id, name, price, image_url) VALUES (?, ?, ?, ?)").run(
+          state.data.subId, state.data.name, state.data.price, text
+        );
+        syncToCloud("products", db.prepare("SELECT * FROM products WHERE id = ?").get(result.lastInsertRowid));
+        userStates.delete(chatId);
+        adminBot.sendMessage(chatId, "✅ تم إضافة المنتج بنجاح!");
+      } else if (state.step === "admin_add_banner_url") {
+        const result = db.prepare("INSERT INTO banners (image_url) VALUES (?)").run(text);
+        syncToCloud("banners", db.prepare("SELECT * FROM banners WHERE id = ?").get(result.lastInsertRowid));
+        userStates.delete(chatId);
+        adminBot.sendMessage(chatId, "✅ تم إضافة البانر بنجاح!");
+      }
+    });
 
     userBot.on("message", async (msg) => {
       const chatId = msg.chat.id;
@@ -1133,6 +1378,7 @@ async function startServer() {
       reply_markup: {
         inline_keyboard: [
           [{ text: "💰 رصيدي", callback_data: "my_balance" }, { text: "👤 معلوماتي", callback_data: "my_info" }],
+          [{ text: "📦 طلباتي", callback_data: "my_orders" }, { text: "💳 دفعاتي", callback_data: "my_payments" }],
           [{ text: "💳 شحن رصيد", callback_data: "topup_balance" }],
           [{ text: "📱 شحن تطبيقات", callback_data: "charge_apps" }],
           [{ text: "🔗 الإحالة", callback_data: "referral" }, { text: "📤 مشاركة", callback_data: "share" }],

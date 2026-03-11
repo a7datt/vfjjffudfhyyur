@@ -59,6 +59,8 @@ interface UserData {
   personal_number: string;
   phone?: string;
   telegram_chat_id?: number | null;
+  is_vip: boolean;
+  is_banned: boolean;
 }
 
 interface Order {
@@ -143,21 +145,61 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    if (user?.telegram_chat_id) {
-      setNotifications([
-        {
-          id: 'tg-link',
-          title: 'تم ربط حسابك ببوت تلجرام',
-          message: 'لقد تم ربط حسابك ببوت تلجرام. إن لم تكن أنت، يرجى الضغط على فك الارتباط وتغيير بياناتك.',
-          type: 'warning',
-          action: 'unlink'
+  const fetchNotifications = async () => {
+    if (!user) return;
+    try {
+      const res = await fetch(`/api/notifications/${user.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        const serverNotifs = data.map((n: any) => ({
+          id: n.id,
+          title: n.title,
+          message: n.message,
+          type: n.type,
+          created_at: n.created_at,
+          is_read: n.is_read
+        }));
+
+        // Add the TG link warning if needed
+        if (user.telegram_chat_id) {
+          serverNotifs.unshift({
+            id: 'tg-link',
+            title: 'تم ربط حسابك ببوت تلجرام',
+            message: 'لقد تم ربط حسابك ببوت تلجرام. إن لم تكن أنت، يرجى الضغط على فك الارتباط وتغيير بياناتك.',
+            type: 'warning',
+            action: 'unlink'
+          });
         }
-      ]);
+        setNotifications(serverNotifs);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      fetchNotifications();
+      const interval = setInterval(fetchNotifications, 30000); // Refresh every 30s
+      return () => clearInterval(interval);
     } else {
       setNotifications([]);
     }
   }, [user]);
+
+  const markNotificationRead = async (id: number | string) => {
+    if (typeof id === 'string') return; // Local notifs
+    try {
+      await fetch("/api/notifications/mark-read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ notificationId: id })
+      });
+      fetchNotifications();
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const handleUnlinkTelegram = async () => {
     if (!user) return;
@@ -169,7 +211,7 @@ export default function App() {
       });
       if (res.ok) {
         fetchUser(user.id);
-        alert("تم فك الارتباط بنجاح. يرجى تغيير كلمة المرور لزيادة الأمان.");
+        alert("تم فك الارتباط بنجاح. لقد تم تسجيل خروجك من بوت تليجرام أيضاً.");
       }
     } catch (e) {
       console.error(e);
@@ -293,6 +335,40 @@ export default function App() {
     setView({ type: "main" });
   };
 
+  // --- Theme Helper ---
+  const getTheme = () => {
+    if (user?.is_vip) {
+      return {
+        primary: "bg-amber-500",
+        primaryHover: "hover:bg-amber-600",
+        text: "text-amber-600",
+        textDark: "text-amber-700",
+        bgLight: "bg-amber-50",
+        border: "border-amber-100",
+        shadow: "shadow-amber-100",
+        gradient: "from-amber-500 to-yellow-600",
+        icon: "text-amber-600",
+        button: "bg-amber-600",
+        buttonHover: "hover:bg-amber-700"
+      };
+    }
+    return {
+      primary: "bg-emerald-500",
+      primaryHover: "hover:bg-emerald-600",
+      text: "text-emerald-600",
+      textDark: "text-emerald-700",
+      bgLight: "bg-emerald-50",
+      border: "border-emerald-100",
+      shadow: "shadow-emerald-100",
+      gradient: "from-emerald-500 to-teal-600",
+      icon: "text-emerald-600",
+      button: "bg-emerald-600",
+      buttonHover: "hover:bg-emerald-700"
+    };
+  };
+
+  const theme = getTheme();
+
   // --- UI Components ---
 
   const Header = () => (
@@ -302,21 +378,21 @@ export default function App() {
           <Menu size={24} className="text-gray-700" />
         </button>
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center text-white font-bold">V</div>
-          <span className="font-bold text-gray-800 hidden sm:block">فيبرو</span>
+          <div className={`w-8 h-8 ${theme.primary} rounded-lg flex items-center justify-center text-white font-bold`}>{user?.is_vip ? "💎" : "V"}</div>
+          <span className={`font-bold text-gray-800 hidden sm:block ${user?.is_vip ? 'text-amber-600' : ''}`}>فيبرو {user?.is_vip && 'VIP'}</span>
         </div>
       </div>
       
       <div className="flex items-center gap-4">
         {user && (
-          <div className="bg-emerald-50 text-emerald-700 px-3 py-1 rounded-full flex items-center gap-2 border border-emerald-100">
+          <div className={`${theme.bgLight} ${theme.textDark} px-3 py-1 rounded-full flex items-center gap-2 border ${theme.border}`}>
             <Wallet size={16} />
             <span className="font-bold">{user.balance.toFixed(2)} $</span>
           </div>
         )}
         <button onClick={() => setNotificationsOpen(true)} className="p-2 hover:bg-gray-50 rounded-full relative">
           <Bell size={22} className="text-gray-600" />
-          {notifications.length > 0 && (
+          {notifications.some(n => !n.is_read) && (
             <span className="absolute top-2 right-2 w-2 h-2 bg-red-500 rounded-full border-2 border-white"></span>
           )}
         </button>
@@ -351,12 +427,28 @@ export default function App() {
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
               {notifications.length > 0 ? (
                 notifications.map(notif => (
-                  <div key={notif.id} className={`p-4 rounded-2xl border ${notif.type === 'warning' ? 'bg-amber-50 border-amber-100' : 'bg-blue-50 border-blue-100'}`}>
-                    <h4 className={`font-bold mb-1 ${notif.type === 'warning' ? 'text-amber-800' : 'text-blue-800'}`}>{notif.title}</h4>
-                    <p className={`text-sm leading-relaxed ${notif.type === 'warning' ? 'text-amber-700' : 'text-blue-700'}`}>{notif.message}</p>
+                  <div 
+                    key={notif.id} 
+                    onClick={() => markNotificationRead(notif.id)}
+                    className={`p-4 rounded-2xl border transition-all ${notif.is_read ? 'opacity-60' : 'shadow-sm'} ${
+                      notif.type === 'warning' ? 'bg-amber-50 border-amber-100' : 
+                      notif.type === 'success' ? 'bg-emerald-50 border-emerald-100' : 'bg-blue-50 border-blue-100'
+                    }`}
+                  >
+                    <div className="flex justify-between items-start mb-1">
+                      <h4 className={`font-bold ${
+                        notif.type === 'warning' ? 'text-amber-800' : 
+                        notif.type === 'success' ? 'text-emerald-800' : 'text-blue-800'
+                      }`}>{notif.title}</h4>
+                      {notif.created_at && <span className="text-[9px] text-gray-400">{new Date(notif.created_at).toLocaleTimeString("ar-EG")}</span>}
+                    </div>
+                    <p className={`text-sm leading-relaxed ${
+                      notif.type === 'warning' ? 'text-amber-700' : 
+                      notif.type === 'success' ? 'text-emerald-700' : 'text-blue-700'
+                    }`}>{notif.message}</p>
                     {notif.action === 'unlink' && (
                       <button 
-                        onClick={handleUnlinkTelegram}
+                        onClick={(e) => { e.stopPropagation(); handleUnlinkTelegram(); }}
                         className="mt-3 bg-amber-600 text-white px-4 py-2 rounded-xl text-xs font-bold shadow-sm"
                       >
                         فك الارتباط الآن
@@ -381,28 +473,28 @@ export default function App() {
     <nav className="fixed bottom-0 left-0 right-0 h-16 bg-white border-t border-gray-100 flex items-center justify-around z-40">
       <button 
         onClick={() => { setActiveTab("home"); setView({ type: "main" }); }}
-        className={`flex flex-col items-center gap-1 ${activeTab === "home" ? "text-emerald-600" : "text-gray-400"}`}
+        className={`flex flex-col items-center gap-1 ${activeTab === "home" ? theme.text : "text-gray-400"}`}
       >
         <Home size={22} />
         <span className="text-[10px] font-medium">الرئيسية</span>
       </button>
       <button 
         onClick={() => setActiveTab("wallet")}
-        className={`flex flex-col items-center gap-1 ${activeTab === "wallet" ? "text-emerald-600" : "text-gray-400"}`}
+        className={`flex flex-col items-center gap-1 ${activeTab === "wallet" ? theme.text : "text-gray-400"}`}
       >
         <Wallet size={22} />
         <span className="text-[10px] font-medium">شحن الرصيد</span>
       </button>
       <button 
         onClick={() => setActiveTab("orders")}
-        className={`flex flex-col items-center gap-1 ${activeTab === "orders" ? "text-emerald-600" : "text-gray-400"}`}
+        className={`flex flex-col items-center gap-1 ${activeTab === "orders" ? theme.text : "text-gray-400"}`}
       >
         <ShoppingBag size={22} />
         <span className="text-[10px] font-medium">الطلبات</span>
       </button>
       <button 
         onClick={() => setActiveTab("profile")}
-        className={`flex flex-col items-center gap-1 ${activeTab === "profile" ? "text-emerald-600" : "text-gray-400"}`}
+        className={`flex flex-col items-center gap-1 ${activeTab === "profile" ? theme.text : "text-gray-400"}`}
       >
         <User size={22} />
         <span className="text-[10px] font-medium">الملخص</span>
@@ -427,12 +519,12 @@ export default function App() {
             exit={{ x: "100%" }}
             className="fixed top-0 right-0 bottom-0 w-72 bg-white z-50 shadow-2xl flex flex-col"
           >
-            <div className="p-6 bg-emerald-600 text-white">
+            <div className={`p-6 ${theme.primary} text-white`}>
               <div className="w-16 h-16 bg-white/20 rounded-2xl flex items-center justify-center mb-4">
                 <User size={32} />
               </div>
               <h3 className="font-bold text-lg">{user ? user.name : "زائر"}</h3>
-              <p className="text-emerald-100 text-sm">{user ? user.email : "سجل الدخول للمزيد"}</p>
+              <p className="text-white/80 text-sm">{user ? user.email : "سجل الدخول للمزيد"}</p>
             </div>
             
             <div className="flex-1 py-4 overflow-y-auto">
@@ -482,7 +574,7 @@ export default function App() {
       <div className="space-y-6 pb-20">
         {/* Hero Carousel */}
         <div className="px-4">
-          <div className="h-44 bg-gray-100 rounded-2xl overflow-hidden relative shadow-lg shadow-emerald-50">
+          <div className={`h-44 bg-gray-100 rounded-2xl overflow-hidden relative shadow-lg ${theme.shadow}`}>
             {banners.length > 0 ? (
               <AnimatePresence mode="wait">
                 <motion.img
@@ -496,9 +588,9 @@ export default function App() {
                 />
               </AnimatePresence>
             ) : (
-              <div className="h-full bg-gradient-to-r from-emerald-500 to-teal-600 flex flex-col justify-center px-6 text-white">
+              <div className={`h-full bg-gradient-to-r ${theme.gradient} flex flex-col justify-center px-6 text-white`}>
                 <h2 className="text-2xl font-bold mb-1">أفضل العروض</h2>
-                <p className="text-emerald-50 opacity-90 text-sm">اشحن ألعابك المفضلة بضغطة واحدة</p>
+                <p className="text-white/90 text-sm">اشحن ألعابك المفضلة بضغطة واحدة</p>
                 <button className="mt-4 bg-white text-emerald-600 px-4 py-1.5 rounded-full text-sm font-bold w-fit">اكتشف الآن</button>
               </div>
             )}
@@ -520,7 +612,7 @@ export default function App() {
       <div className="px-4">
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-bold text-gray-800">الأقسام الرئيسية</h3>
-          <button className="text-emerald-600 text-sm font-medium">عرض الكل</button>
+          <button className={`${theme.text} text-sm font-medium`}>عرض الكل</button>
         </div>
         <div className="grid grid-cols-3 gap-3">
           {categories.map(cat => (
@@ -531,9 +623,9 @@ export default function App() {
                 fetchSubcategories(cat.id);
                 setView({ type: "subcategories", id: cat.id, data: cat.name });
               }}
-              className="bg-white p-3 rounded-xl border border-gray-100 shadow-sm flex flex-col items-center gap-2 hover:border-emerald-200 transition-colors"
+              className={`bg-white p-3 rounded-xl border border-gray-100 shadow-sm flex flex-col items-center gap-2 hover:${theme.border} transition-colors`}
             >
-              <div className="w-14 h-14 bg-emerald-50 rounded-xl flex items-center justify-center overflow-hidden">
+              <div className={`w-14 h-14 ${theme.bgLight} rounded-xl flex items-center justify-center overflow-hidden`}>
                 <img src={cat.image_url} alt={cat.name} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
               </div>
               <span className="font-bold text-gray-700 text-[10px] text-center">{cat.name}</span>
@@ -619,7 +711,7 @@ export default function App() {
               </div>
               <div className="flex-1">
                 <h4 className="font-bold text-gray-800">{prod.name}</h4>
-                <p className="text-emerald-600 font-bold">{prod.price.toFixed(2)} $</p>
+                <p className={`${theme.text} font-bold`}>{prod.price.toFixed(2)} $</p>
               </div>
             </div>
             <p className="text-gray-500 text-sm leading-relaxed">{prod.description || "لا يوجد وصف متاح لهذا المنتج."}</p>
@@ -632,7 +724,7 @@ export default function App() {
                   setView({ type: "checkout", data: prod });
                 }
               }}
-              className="w-full bg-emerald-600 text-white py-3 rounded-xl font-bold hover:bg-emerald-700 transition-colors"
+              className={`w-full ${theme.button} text-white py-3 rounded-xl font-bold ${theme.buttonHover} transition-colors`}
             >
               {prod.store_type === 'quick_order' ? "طلب سريع" : "شراء الآن"}
             </button>
@@ -694,8 +786,8 @@ export default function App() {
             <h4 className="font-bold text-lg text-gray-800">{prod.name}</h4>
             <div className="flex flex-col items-center">
               {user?.is_vip && <p className="text-gray-400 line-through text-sm">{prod.price.toFixed(2)} $</p>}
-              <p className="text-emerald-600 font-bold text-xl">{finalPrice.toFixed(2)} $</p>
-              {user?.is_vip && <span className="text-[10px] bg-purple-100 text-purple-600 px-2 py-0.5 rounded-full font-bold mt-1">خصم VIP 5%</span>}
+              <p className={`${theme.text} font-bold text-xl`}>{finalPrice.toFixed(2)} $</p>
+              {user?.is_vip && <span className="text-[10px] bg-amber-100 text-amber-600 px-2 py-0.5 rounded-full font-bold mt-1">خصم VIP 5%</span>}
             </div>
           </div>
 
@@ -707,7 +799,7 @@ export default function App() {
                 value={playerId}
                 onChange={(e) => setPlayerId(e.target.value)}
                 placeholder="أدخل المعرف هنا..."
-                className="w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-4 text-center text-lg font-bold outline-none focus:border-emerald-500"
+                className={`w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-4 text-center text-lg font-bold outline-none focus:${theme.border}`}
               />
             </div>
 
@@ -721,7 +813,7 @@ export default function App() {
             <button 
               disabled={loading}
               onClick={handleQuickOrder}
-              className="w-full bg-emerald-600 text-white py-4 rounded-xl font-bold shadow-lg shadow-emerald-100 disabled:opacity-50"
+              className={`w-full ${theme.button} text-white py-4 rounded-xl font-bold shadow-lg ${theme.shadow} disabled:opacity-50`}
             >
               {loading ? "جاري الإرسال..." : "إرسال الطلب"}
             </button>
@@ -787,8 +879,8 @@ export default function App() {
               <h4 className="font-bold text-gray-800">{prod.name}</h4>
               <div className="flex items-center gap-2">
                 {user?.is_vip && <p className="text-gray-400 line-through text-xs">{prod.price.toFixed(2)} $</p>}
-                <p className="text-emerald-600 font-bold">{finalPrice.toFixed(2)} $</p>
-                {user?.is_vip && <span className="text-[10px] bg-purple-100 text-purple-600 px-2 py-0.5 rounded-full font-bold">VIP</span>}
+                <p className={`${theme.text} font-bold`}>{finalPrice.toFixed(2)} $</p>
+                {user?.is_vip && <span className="text-[10px] bg-amber-100 text-amber-600 px-2 py-0.5 rounded-full font-bold">VIP</span>}
               </div>
             </div>
           </div>
@@ -801,7 +893,7 @@ export default function App() {
                 value={extraData}
                 onChange={(e) => setExtraData(e.target.value)}
                 placeholder="أدخل البيانات هنا..."
-                className="w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 outline-none focus:border-emerald-500 transition-colors"
+                className={`w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 outline-none focus:${theme.border} transition-colors`}
               />
             </div>
           )}
@@ -812,18 +904,14 @@ export default function App() {
               <span className="font-bold">{prod.price.toFixed(2)} $</span>
             </div>
             {user?.is_vip && (
-              <div className="flex justify-between text-sm text-purple-600">
+              <div className="flex justify-between text-sm text-amber-600">
                 <span>خصم VIP (5%)</span>
                 <span className="font-bold">- {(prod.price * 0.05).toFixed(2)} $</span>
               </div>
             )}
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-500">الضريبة</span>
-              <span className="font-bold">0.00 $</span>
-            </div>
             <div className="flex justify-between text-lg border-t border-gray-50 pt-3">
               <span className="font-bold text-gray-800">الإجمالي</span>
-              <span className="font-bold text-emerald-600">{finalPrice.toFixed(2)} $</span>
+              <span className={`font-bold ${theme.text}`}>{finalPrice.toFixed(2)} $</span>
             </div>
           </div>
 
@@ -832,7 +920,7 @@ export default function App() {
           <button 
             disabled={loading}
             onClick={handlePurchase}
-            className="w-full bg-emerald-600 text-white py-4 rounded-xl font-bold shadow-lg shadow-emerald-100 flex items-center justify-center gap-2 disabled:opacity-50"
+            className={`w-full ${theme.button} text-white py-4 rounded-xl font-bold shadow-lg ${theme.shadow} flex items-center justify-center gap-2 disabled:opacity-50`}
           >
             {loading ? "جاري المعالجة..." : "تأكيد الدفع بالرصيد"}
           </button>
@@ -1093,33 +1181,95 @@ export default function App() {
 
   const ProfileView = () => (
     <div className="px-4 space-y-6 pb-20">
-      <div className="bg-white p-6 rounded-3xl border border-gray-100 shadow-sm flex flex-col items-center text-center space-y-4">
-        <div className="w-24 h-24 bg-emerald-50 rounded-full flex items-center justify-center text-emerald-600 border-4 border-white shadow-lg shadow-emerald-50">
+      <div className={`bg-white p-6 rounded-3xl border border-gray-100 shadow-sm flex flex-col items-center text-center space-y-4 ${user?.is_vip ? 'border-amber-200 shadow-amber-50' : ''}`}>
+        <div className={`w-24 h-24 ${theme.bgLight} rounded-full flex items-center justify-center ${theme.icon} border-4 border-white shadow-lg ${theme.shadow}`}>
           <User size={48} />
         </div>
         <div>
-          <h2 className="text-xl font-bold text-gray-800">{user?.name || "زائر"}</h2>
+          <h2 className={`text-xl font-bold text-gray-800 ${user?.is_vip ? 'text-amber-700' : ''}`}>{user?.name || "زائر"}</h2>
           <p className="text-gray-400 text-sm">{user?.email || "قم بتسجيل الدخول للوصول لكافة الميزات"}</p>
         </div>
         
         {user && (
+          <div className="w-full pt-4 space-y-3">
+            <div className="flex items-center justify-between gap-4">
+              {user.telegram_chat_id ? (
+                <button 
+                  onClick={handleUnlinkTelegram}
+                  className="flex-1 bg-red-50 text-red-600 p-4 rounded-2xl border border-red-100 flex flex-col items-center gap-1 transition-all active:scale-95"
+                >
+                  <LogOut size={20} />
+                  <span className="text-xs font-bold">إلغاء ربط تليجرام</span>
+                </button>
+              ) : (
+                <button 
+                  onClick={() => window.open(`https://t.me/vibro_bot`, '_blank')}
+                  className="flex-1 bg-emerald-50 text-emerald-600 p-4 rounded-2xl border border-emerald-100 flex flex-col items-center gap-1 transition-all active:scale-95"
+                >
+                  <MessageSquare size={20} />
+                  <span className="text-xs font-bold">ربط تليجرام</span>
+                </button>
+              )}
+              <button 
+                onClick={() => setView({ type: "referral" })}
+                className="flex-1 bg-purple-50 text-purple-600 p-4 rounded-2xl border border-purple-100 flex flex-col items-center gap-1 transition-all active:scale-95"
+              >
+                <Plus size={20} />
+                <span className="text-xs font-bold">نظام الإحالة</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {user && (
           <div className="w-full grid grid-cols-2 gap-4 pt-4">
-            <div className="bg-emerald-50 p-4 rounded-2xl border border-emerald-100">
-              <p className="text-[10px] text-emerald-600 font-bold uppercase tracking-wider mb-1">الرصيد الحالي</p>
-              <p className="text-lg font-bold text-emerald-700">{user.balance.toFixed(2)} $</p>
+            <div className={`${theme.bgLight} p-4 rounded-2xl border ${theme.border}`}>
+              <p className={`text-[10px] ${theme.text} font-bold uppercase tracking-wider mb-1`}>الرصيد الحالي</p>
+              <p className={`text-lg font-bold ${theme.textDark}`}>{user.balance.toFixed(2)} $</p>
             </div>
             <div className="bg-blue-50 p-4 rounded-2xl border border-blue-100">
               <p className="text-[10px] text-blue-600 font-bold uppercase tracking-wider mb-1">إجمالي الطلبات</p>
               <p className="text-lg font-bold text-blue-700">{orders.length}</p>
             </div>
-            <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100">
-              <p className="text-[10px] text-gray-600 font-bold uppercase tracking-wider mb-1">الحالة</p>
-              <p className="text-lg font-bold text-gray-700">{user.is_vip ? 'VIP 💎' : 'عادي'}</p>
+            <div className={`${user.is_vip ? 'bg-amber-100 border-amber-200' : 'bg-gray-50 border-gray-100'} p-4 rounded-2xl border`}>
+              <p className={`text-[10px] ${user.is_vip ? 'text-amber-600' : 'text-gray-600'} font-bold uppercase tracking-wider mb-1`}>الحالة</p>
+              <p className={`text-lg font-bold ${user.is_vip ? 'text-amber-700' : 'text-gray-700'}`}>{user.is_vip ? 'VIP 💎' : 'عادي'}</p>
             </div>
             <div className="bg-purple-50 p-4 rounded-2xl border border-purple-100">
               <p className="text-[10px] text-purple-600 font-bold uppercase tracking-wider mb-1">الرقم الشخصي</p>
               <p className="text-lg font-bold text-purple-700">{user.personal_number}</p>
             </div>
+          </div>
+        )}
+
+        {user && (
+          <div className="w-full pt-4 space-y-3">
+            <h4 className="text-sm font-bold text-gray-700 text-right">حالة الحساب</h4>
+            {user.telegram_chat_id ? (
+              <div className="bg-emerald-50 p-4 rounded-2xl border border-emerald-100 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-emerald-100 text-emerald-600 rounded-xl flex items-center justify-center">
+                    <CheckCircle size={20} />
+                  </div>
+                  <div className="text-right">
+                    <p className="text-sm font-bold text-emerald-800">تليجرام مرتبط</p>
+                    <p className="text-[10px] text-emerald-600">حسابك مؤمن ومرتبط بالبوت</p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="bg-orange-50 p-4 rounded-2xl border border-orange-100 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-orange-100 text-orange-600 rounded-xl flex items-center justify-center">
+                    <Clock size={20} />
+                  </div>
+                  <div className="text-right">
+                    <p className="text-sm font-bold text-orange-800">تليجرام غير مرتبط</p>
+                    <p className="text-[10px] text-orange-600">اربط حسابك لتلقي الإشعارات</p>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
